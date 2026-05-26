@@ -70,18 +70,7 @@ export class DefensiaClient {
     return this.request(`/bans?page=${page}`);
   }
 
-  async createBan(ip: string, reason?: string): Promise<Ban> {
-    return this.request('/bans', {
-      method: 'POST',
-      body: JSON.stringify({ ip_address: ip, reason }),
-    });
-  }
-
-  async removeBan(id: number): Promise<{ message: string }> {
-    return this.request(`/bans/${id}`, { method: 'DELETE' });
-  }
-
-  // ── Briefing (requires new endpoint) ───────────────────────
+  // ── Briefing ────────────────────────────────────────────────
 
   async getBriefing(since = '12 hours'): Promise<Briefing> {
     return this.request(`/briefing?since=${encodeURIComponent(since)}`);
