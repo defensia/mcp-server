@@ -22,9 +22,17 @@ const client = new DefensiaClient({
   apiToken: DEFENSIA_API_TOKEN,
 });
 
-// ── Simple cache ─────────────────────────────────────────────
+// ── LRU Cache ───────────────────────────────────────────────
 
+const MAX_CACHE_ENTRIES = 50;
 const cache = new Map<string, { data: unknown; expires: number }>();
+
+function evictExpired(): void {
+  const now = Date.now();
+  for (const [key, entry] of cache) {
+    if (entry.expires <= now) cache.delete(key);
+  }
+}
 
 function cached<T>(key: string, ttlMs: number, fn: () => Promise<T>): Promise<T> {
   const entry = cache.get(key);
@@ -32,10 +40,42 @@ function cached<T>(key: string, ttlMs: number, fn: () => Promise<T>): Promise<T>
     return Promise.resolve(entry.data as T);
   }
   return fn().then(data => {
+    // Evict expired entries and enforce max size
+    evictExpired();
+    if (cache.size >= MAX_CACHE_ENTRIES) {
+      const oldest = cache.keys().next().value;
+      if (oldest !== undefined) cache.delete(oldest);
+    }
     cache.set(key, { data, expires: Date.now() + ttlMs });
     return data;
   });
 }
+
+// ── Sanitization ────────────────────────────────────────────
+
+/** Sanitize untrusted string from API to prevent markdown/prompt injection */
+function sanitize(value: string | null | undefined, maxLen = 200): string {
+  if (!value) return '';
+  return value
+    .replace(/[*_`~\[\]#>|]/g, '') // strip markdown formatting chars
+    .replace(/\n/g, ' ')           // collapse newlines
+    .slice(0, maxLen);
+}
+
+/** Safe error message extraction */
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return 'Unknown error';
+}
+
+// ── Tool annotations (all tools are read-only) ──────────────
+
+const READ_ONLY_ANNOTATIONS = {
+  readOnlyHint: true as const,
+  destructiveHint: false as const,
+  idempotentHint: true as const,
+  openWorldHint: true as const,
+};
 
 // ── Formatters ───────────────────────────────────────────────
 
@@ -44,7 +84,7 @@ function formatStats(stats: DashboardStats): string {
   const e = stats.events;
   const b = stats.bans;
 
-  const lines = [
+  return [
     `## Security Overview`,
     ``,
     `### Servers (${s.total})`,
@@ -60,23 +100,21 @@ function formatStats(stats: DashboardStats): string {
     `### Active Bans`,
     `- Active: ${b.active}`,
     `- All-time: ${b.total}`,
-  ];
-
-  return lines.join('\n');
+  ].join('\n');
 }
 
 function formatServer(server: Server): string {
   const statusIcon = server.status === 'online' ? '🟢' : server.status === 'offline' ? '🔴' : '🟡';
   const lines = [
-    `## ${statusIcon} ${server.name} (${server.hostname})`,
+    `## ${statusIcon} ${sanitize(server.name)} (${sanitize(server.hostname)})`,
     ``,
-    `- **IP:** ${server.ip_address}`,
-    `- **Status:** ${server.status}`,
-    `- **OS:** ${server.os} ${server.os_version}`,
-    `- **Agent version:** ${server.version}`,
-    `- **Last seen:** ${server.last_seen_at}`,
-    `- **Mode:** ${server.monitor_mode ? 'Monitor (observe-only)' : 'Active (blocking)'}`,
-    `- **WAF:** ${server.waf_config ? 'Enabled' : 'Disabled'}`,
+    `- IP: ${sanitize(server.ip_address)}`,
+    `- Status: ${server.status}`,
+    `- OS: ${sanitize(server.os)} ${sanitize(server.os_version)}`,
+    `- Agent version: ${sanitize(server.version)}`,
+    `- Last seen: ${sanitize(server.last_seen_at)}`,
+    `- Mode: ${server.monitor_mode ? 'Monitor (observe-only)' : 'Active (blocking)'}`,
+    `- WAF: ${server.waf_config ? 'Enabled' : 'Disabled'}`,
     ``,
     `### Resources`,
     `- CPU: ${server.cpu_percent !== null ? server.cpu_percent + '%' : 'N/A'}`,
@@ -89,14 +127,14 @@ function formatServer(server: Server): string {
     lines.push('', '### Recent Events');
     for (const e of server.events.slice(0, 10)) {
       const sev = e.severity === 'critical' ? '🔴' : e.severity === 'high' ? '🟠' : e.severity === 'warning' ? '🟡' : '⚪';
-      lines.push(`- ${sev} **${e.type}** from ${e.source_ip || 'unknown'} ${e.country_code ? `(${e.country_code})` : ''} — ${e.occurred_at}`);
+      lines.push(`- ${sev} ${sanitize(e.type)} from ${sanitize(e.source_ip) || 'unknown'} ${e.country_code ? `(${sanitize(e.country_code, 5)})` : ''} — ${sanitize(e.occurred_at, 30)}`);
     }
   }
 
   if (server.bans?.length) {
     lines.push('', '### Active Bans');
     for (const b of server.bans.slice(0, 10)) {
-      lines.push(`- ${b.ip_address} — ${b.reason} (expires: ${b.expires_at || 'permanent'})`);
+      lines.push(`- ${sanitize(b.ip_address, 45)} — ${sanitize(b.reason, 100)} (expires: ${sanitize(b.expires_at, 30) || 'permanent'})`);
     }
   }
 
@@ -114,7 +152,11 @@ function formatServerList(data: PaginatedResponse<Server>): string {
     const cpu = s.cpu_percent !== null ? `CPU ${s.cpu_percent}%` : '';
     const mem = s.memory_percent !== null ? `MEM ${s.memory_percent}%` : '';
     const metrics = [cpu, mem].filter(Boolean).join(', ');
-    lines.push(`${icon} **${s.name}** (ID: ${s.id}) — ${s.status} | ${s.ip_address} | ${metrics || 'no metrics'} | Bans: ${s.active_bans_count}`);
+    lines.push(`${icon} ${sanitize(s.name)} (ID: ${s.id}) — ${s.status} | ${sanitize(s.ip_address, 45)} | ${metrics || 'no metrics'} | Bans: ${s.active_bans_count}`);
+  }
+
+  if (data.current_page < data.last_page) {
+    lines.push('', `To see the next page, call this tool again with page: ${data.current_page + 1}`);
   }
 
   return lines.join('\n');
@@ -128,14 +170,18 @@ function formatEvents(data: PaginatedResponse<SecurityEvent>): string {
 
   for (const e of data.data) {
     const sev = e.severity === 'critical' ? '🔴' : e.severity === 'high' ? '🟠' : e.severity === 'warning' ? '🟡' : '⚪';
-    const server = e.agent ? e.agent.name : `agent#${e.agent_id}`;
-    lines.push(`${sev} **${e.type}** on ${server} from ${e.source_ip || 'unknown'} ${e.country_code ? `(${e.country_code})` : ''} — ${e.occurred_at}`);
+    const server = e.agent ? sanitize(e.agent.name) : `agent#${e.agent_id}`;
+    lines.push(`${sev} ${sanitize(e.type)} on ${server} from ${sanitize(e.source_ip) || 'unknown'} ${e.country_code ? `(${sanitize(e.country_code, 5)})` : ''} — ${sanitize(e.occurred_at, 30)}`);
     if (e.details && Object.keys(e.details).length > 0) {
       const detail = JSON.stringify(e.details);
       if (detail.length < 200) {
-        lines.push(`  Details: ${detail}`);
+        lines.push(`  Details: ${sanitize(detail)}`);
       }
     }
+  }
+
+  if (data.current_page < data.last_page) {
+    lines.push('', `To see the next page, call this tool again with page: ${data.current_page + 1}`);
   }
 
   return lines.join('\n');
@@ -148,10 +194,14 @@ function formatBans(data: PaginatedResponse<Ban>): string {
   ];
 
   for (const b of data.data) {
-    const server = b.agent ? b.agent.name : 'global';
-    const expires = b.expires_at || 'permanent';
+    const server = b.agent ? sanitize(b.agent.name) : 'global';
+    const expires = sanitize(b.expires_at, 30) || 'permanent';
     const escalation = b.ban_count > 1 ? ` (offense #${b.ban_count})` : '';
-    lines.push(`- **${b.ip_address}** on ${server} — ${b.reason}${escalation} | Expires: ${expires}`);
+    lines.push(`- ${sanitize(b.ip_address, 45)} on ${server} — ${sanitize(b.reason, 100)}${escalation} | Expires: ${expires}`);
+  }
+
+  if (data.current_page < data.last_page) {
+    lines.push('', `To see the next page, call this tool again with page: ${data.current_page + 1}`);
   }
 
   return lines.join('\n');
@@ -164,8 +214,8 @@ function formatBriefing(briefing: Briefing): string {
     : '🔴 Attention Needed';
 
   const lines = [
-    `## Security Briefing — ${briefing.period.label}`,
-    `**Status: ${statusLabel}**`,
+    `## Security Briefing — ${sanitize(briefing.period.label, 50)}`,
+    `Status: ${statusLabel}`,
     ``,
     `### Summary`,
     `- Events: ${s.total_events} (${s.critical_events} critical)`,
@@ -180,26 +230,26 @@ function formatBriefing(briefing: Briefing): string {
     lines.push(`- Trend: ${direction} ${Math.abs(t.events_delta_percent)}% vs previous period`);
   }
   if (t.top_attack_type) {
-    lines.push(`- Top attack type: ${t.top_attack_type}`);
+    lines.push(`- Top attack type: ${sanitize(t.top_attack_type, 50)}`);
   }
   if (Object.keys(t.top_countries).length > 0) {
-    const countries = Object.entries(t.top_countries).map(([c, n]) => `${c} (${n})`).join(', ');
+    const countries = Object.entries(t.top_countries).slice(0, 10).map(([c, n]) => `${sanitize(c, 5)} (${n})`).join(', ');
     lines.push(`- Top source countries: ${countries}`);
   }
 
   // WAF
   if (briefing.waf.total > 0) {
     lines.push('', `### WAF Activity (${briefing.waf.total} events)`);
-    for (const w of briefing.waf.by_type) {
-      lines.push(`- ${w.label}: ${w.count}`);
+    for (const w of briefing.waf.by_type.slice(0, 10)) {
+      lines.push(`- ${sanitize(w.label, 50)}: ${w.count}`);
     }
     if (briefing.waf.scoring) {
       const ws = briefing.waf.scoring;
       lines.push(`- Blocked: ${ws.blocked} | Observed: ${ws.observed} | Throttled: ${ws.throttled}`);
       if (ws.top_ips.length > 0) {
-        lines.push('', '**Top suspicious IPs:**');
-        for (const ip of ws.top_ips) {
-          lines.push(`  - ${ip.ip} — score ${ip.max_score}, action: ${ip.action}, category: ${ip.category}`);
+        lines.push('', 'Top suspicious IPs:');
+        for (const ip of ws.top_ips.slice(0, 10)) {
+          lines.push(`  - ${sanitize(ip.ip, 45)} — score ${ip.max_score}, action: ${sanitize(ip.action, 20)}, category: ${sanitize(ip.category, 30)}`);
         }
       }
     }
@@ -209,7 +259,7 @@ function formatBriefing(briefing: Briefing): string {
   if (briefing.incidents.length > 0) {
     lines.push('', `### Incidents (${briefing.incidents.length})`);
     for (const inc of briefing.incidents.slice(0, 10)) {
-      lines.push(`- ${inc.narrative}`);
+      lines.push(`- ${sanitize(inc.narrative, 300)}`);
     }
   }
 
@@ -221,7 +271,7 @@ function formatBriefing(briefing: Briefing): string {
       const issues = [];
       if (r.disk_warning) issues.push(`disk ${r.disk_current}%`);
       if (r.cpu_current && r.cpu_current > 80) issues.push(`CPU ${r.cpu_current}%`);
-      lines.push(`- **${r.server}**: ${issues.join(', ')}`);
+      lines.push(`- ${sanitize(r.server)}: ${issues.join(', ')}`);
     }
   }
 
@@ -235,9 +285,9 @@ function formatBriefing(briefing: Briefing): string {
   // Recommendations
   if (briefing.recommendations.length > 0) {
     lines.push('', '### Recommendations');
-    for (const rec of briefing.recommendations) {
+    for (const rec of briefing.recommendations.slice(0, 10)) {
       const icon = rec.severity === 'critical' ? '🔴' : '🟡';
-      lines.push(`${icon} **${rec.title}** — ${rec.description}`);
+      lines.push(`${icon} ${sanitize(rec.title, 100)} — ${sanitize(rec.description, 300)}`);
     }
   }
 
@@ -248,7 +298,7 @@ function formatBriefing(briefing: Briefing): string {
 
 const server = new McpServer({
   name: 'defensia',
-  version: '0.1.0',
+  version: '0.2.0',
 });
 
 // Tool 1: Security Overview
@@ -256,12 +306,13 @@ server.tool(
   'get_security_overview',
   'Get a high-level security overview of all your servers: counts, events today, active bans, and server status.',
   {},
+  READ_ONLY_ANNOTATIONS,
   async () => {
     try {
       const stats = await cached('stats', 30_000, () => client.getStats());
       return { content: [{ type: 'text', text: formatStats(stats) }] };
     } catch (err) {
-      return { content: [{ type: 'text', text: `Error: ${(err as Error).message}` }], isError: true };
+      return { content: [{ type: 'text', text: `Error: ${errorMessage(err)}` }], isError: true };
     }
   },
 );
@@ -270,13 +321,14 @@ server.tool(
 server.tool(
   'list_servers',
   'List all monitored servers with their status, IP, resource usage, and active ban count.',
-  { page: z.number().optional().describe('Page number (default 1)') },
+  { page: z.number().int().positive().optional().describe('Page number (default 1)') },
+  READ_ONLY_ANNOTATIONS,
   async ({ page }) => {
     try {
       const data = await cached(`servers-${page || 1}`, 30_000, () => client.getServers(page || 1));
       return { content: [{ type: 'text', text: formatServerList(data) }] };
     } catch (err) {
-      return { content: [{ type: 'text', text: `Error: ${(err as Error).message}` }], isError: true };
+      return { content: [{ type: 'text', text: `Error: ${errorMessage(err)}` }], isError: true };
     }
   },
 );
@@ -285,13 +337,14 @@ server.tool(
 server.tool(
   'get_server_details',
   'Get detailed info about a specific server including recent events, active bans, resources, and WAF config. Use list_servers first to find the server ID.',
-  { server_id: z.number().describe('The server ID') },
+  { server_id: z.number().int().positive().describe('The server ID') },
+  READ_ONLY_ANNOTATIONS,
   async ({ server_id }) => {
     try {
-      const server = await client.getServer(server_id);
-      return { content: [{ type: 'text', text: formatServer(server) }] };
+      const srv = await client.getServer(server_id);
+      return { content: [{ type: 'text', text: formatServer(srv) }] };
     } catch (err) {
-      return { content: [{ type: 'text', text: `Error: ${(err as Error).message}` }], isError: true };
+      return { content: [{ type: 'text', text: `Error: ${errorMessage(err)}` }], isError: true };
     }
   },
 );
@@ -302,16 +355,17 @@ server.tool(
   'Search security events across all servers. Filter by severity (info/warning/high/critical), event type (brute_force, sql_injection, bot_detected, etc.), or specific server.',
   {
     severity: z.enum(['info', 'warning', 'high', 'critical']).optional().describe('Filter by severity'),
-    type: z.string().optional().describe('Filter by event type: brute_force, sql_injection, xss_attempt, path_traversal, rce_attempt, scanner_detected, bot_detected, 404_flood, port_scan, flood, geoblock, etc.'),
-    server_id: z.number().optional().describe('Filter by server ID'),
-    page: z.number().optional().describe('Page number (default 1)'),
+    type: z.string().max(50).optional().describe('Filter by event type: brute_force, sql_injection, xss_attempt, path_traversal, rce_attempt, scanner_detected, bot_detected, 404_flood, port_scan, flood, geoblock, etc.'),
+    server_id: z.number().int().positive().optional().describe('Filter by server ID'),
+    page: z.number().int().positive().optional().describe('Page number (default 1)'),
   },
+  READ_ONLY_ANNOTATIONS,
   async (params) => {
     try {
       const data = await client.getEvents(params);
       return { content: [{ type: 'text', text: formatEvents(data) }] };
     } catch (err) {
-      return { content: [{ type: 'text', text: `Error: ${(err as Error).message}` }], isError: true };
+      return { content: [{ type: 'text', text: `Error: ${errorMessage(err)}` }], isError: true };
     }
   },
 );
@@ -320,13 +374,14 @@ server.tool(
 server.tool(
   'get_active_bans',
   'List all currently active IP bans across your servers, with reason, escalation count, and expiry.',
-  { page: z.number().optional().describe('Page number (default 1)') },
+  { page: z.number().int().positive().optional().describe('Page number (default 1)') },
+  READ_ONLY_ANNOTATIONS,
   async ({ page }) => {
     try {
       const data = await client.getBans(page || 1);
       return { content: [{ type: 'text', text: formatBans(data) }] };
     } catch (err) {
-      return { content: [{ type: 'text', text: `Error: ${(err as Error).message}` }], isError: true };
+      return { content: [{ type: 'text', text: `Error: ${errorMessage(err)}` }], isError: true };
     }
   },
 );
@@ -338,12 +393,13 @@ server.tool(
   {
     period: z.enum(['6 hours', '12 hours', '24 hours', '7 days']).optional().describe('Time period (default: 12 hours)'),
   },
+  READ_ONLY_ANNOTATIONS,
   async ({ period }) => {
     try {
       const briefing = await cached(`briefing-${period || '12 hours'}`, 60_000, () => client.getBriefing(period || '12 hours'));
       return { content: [{ type: 'text', text: formatBriefing(briefing) }] };
     } catch (err) {
-      return { content: [{ type: 'text', text: `Error: ${(err as Error).message}` }], isError: true };
+      return { content: [{ type: 'text', text: `Error: ${errorMessage(err)}` }], isError: true };
     }
   },
 );

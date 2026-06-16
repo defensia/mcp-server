@@ -2,6 +2,8 @@
  * Defensia API client — thin wrapper around the Sanctum-authenticated REST API.
  */
 
+const REQUEST_TIMEOUT_MS = 15_000;
+
 export interface DefensiaConfig {
   baseUrl: string;
   apiToken: string;
@@ -18,22 +20,34 @@ export class DefensiaClient {
 
   private async request<T>(path: string, options?: RequestInit): Promise<T> {
     const url = `${this.baseUrl}/api/v1${path}`;
-    const res = await fetch(url, {
-      ...options,
-      headers: {
-        'Authorization': `Bearer ${this.apiToken}`,
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-        ...options?.headers,
-      },
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`Defensia API ${res.status}: ${res.statusText} — ${body}`);
+    try {
+      const res = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+        headers: {
+          'Authorization': `Bearer ${this.apiToken}`,
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          ...options?.headers,
+        },
+      });
+
+      if (!res.ok) {
+        throw new Error(`Defensia API error ${res.status}: ${res.statusText}`);
+      }
+
+      return res.json() as Promise<T>;
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw new Error(`Defensia API timeout after ${REQUEST_TIMEOUT_MS / 1000}s`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeout);
     }
-
-    return res.json() as Promise<T>;
   }
 
   // ── Dashboard ──────────────────────────────────────────────
@@ -45,11 +59,12 @@ export class DefensiaClient {
   // ── Servers ────────────────────────────────────────────────
 
   async getServers(page = 1): Promise<PaginatedResponse<Server>> {
-    return this.request(`/servers?page=${page}`);
+    const qs = new URLSearchParams({ page: String(page) });
+    return this.request(`/servers?${qs}`);
   }
 
   async getServer(id: number): Promise<Server> {
-    return this.request(`/servers/${id}`);
+    return this.request(`/servers/${encodeURIComponent(id)}`);
   }
 
   // ── Events ─────────────────────────────────────────────────
@@ -67,13 +82,15 @@ export class DefensiaClient {
   // ── Bans ───────────────────────────────────────────────────
 
   async getBans(page = 1): Promise<PaginatedResponse<Ban>> {
-    return this.request(`/bans?page=${page}`);
+    const qs = new URLSearchParams({ page: String(page) });
+    return this.request(`/bans?${qs}`);
   }
 
   // ── Briefing ────────────────────────────────────────────────
 
   async getBriefing(since = '12 hours'): Promise<Briefing> {
-    return this.request(`/briefing?since=${encodeURIComponent(since)}`);
+    const qs = new URLSearchParams({ since });
+    return this.request(`/briefing?${qs}`);
   }
 }
 
