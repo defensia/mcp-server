@@ -4,13 +4,15 @@
   "description": "MCP server for Defensia — query your server security status from any AI assistant",
   "type": "module",
   "bin": {
-    "defensia-mcp": "./dist/index.js"
+    "defensia-mcp": "./dist/index.js",
+    "defensia-mcp-http": "./dist/http.js"
   },
   "main": "./dist/index.js",
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
+    "start:http": "node dist/http.js",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
