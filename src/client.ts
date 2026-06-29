@@ -75,15 +75,31 @@ export class DefensiaClient {
     if (params?.severity) qs.set('severity', params.severity);
     if (params?.type) qs.set('type', params.type);
     if (params?.server_id) qs.set('server_id', String(params.server_id));
+    if (params?.ip) qs.set('ip', params.ip);
+    if (params?.since) qs.set('since', params.since);
+    if (params?.per_page) qs.set('per_page', String(params.per_page));
     const query = qs.toString();
     return this.request(`/events${query ? '?' + query : ''}`);
   }
 
   // ── Bans ───────────────────────────────────────────────────
 
-  async getBans(page = 1): Promise<PaginatedResponse<Ban>> {
-    const qs = new URLSearchParams({ page: String(page) });
-    return this.request(`/bans?${qs}`);
+  async getBans(params?: BanParams): Promise<PaginatedResponse<Ban>> {
+    const qs = new URLSearchParams();
+    if (params?.page) qs.set('page', String(params.page));
+    if (params?.ip) qs.set('ip', params.ip);
+    if (params?.server_id) qs.set('server_id', String(params.server_id));
+    if (params?.since) qs.set('since', params.since);
+    if (params?.include_expired) qs.set('include_expired', '1');
+    const query = qs.toString();
+    return this.request(`/bans${query ? '?' + query : ''}`);
+  }
+
+  // ── Top Attackers ────────────────────────────────────────────
+
+  async getTopAttackers(since = '24 hours', limit = 20): Promise<TopAttackers> {
+    const qs = new URLSearchParams({ since, limit: String(limit) });
+    return this.request(`/events/top-attackers?${qs}`);
   }
 
   // ── Briefing ────────────────────────────────────────────────
@@ -166,6 +182,36 @@ export interface EventParams {
   severity?: string;
   type?: string;
   server_id?: number;
+  ip?: string;
+  since?: string;
+  per_page?: number;
+}
+
+export interface BanParams {
+  page?: number;
+  ip?: string;
+  server_id?: number;
+  since?: string;
+  include_expired?: boolean;
+}
+
+export interface TopAttackers {
+  period: string;
+  top_ips: Array<{
+    source_ip: string;
+    event_count: number;
+    max_severity: string;
+    attack_types: string;
+    countries: string;
+  }>;
+  top_countries: Array<{
+    country_code: string;
+    event_count: number;
+  }>;
+  top_attack_types: Array<{
+    type: string;
+    event_count: number;
+  }>;
 }
 
 export interface PaginatedResponse<T> {

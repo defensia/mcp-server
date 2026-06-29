@@ -4,7 +4,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { DefensiaClient } from './client.js';
-import type { Briefing, DashboardStats, Server, SecurityEvent, Ban, PaginatedResponse } from './client.js';
+import type { Briefing, DashboardStats, Server, SecurityEvent, Ban, PaginatedResponse, TopAttackers } from './client.js';
 
 // ── Config ───────────────────────────────────────────────────
 
@@ -310,11 +310,45 @@ function formatBriefing(briefing: Briefing): string {
   return lines.join('\n');
 }
 
+function formatTopAttackers(data: TopAttackers): string {
+  const lines = [
+    `## Top Attackers — ${sanitize(data.period, 30)}`,
+    '',
+  ];
+
+  if (data.top_ips.length > 0) {
+    lines.push('### Top IPs');
+    for (const ip of data.top_ips) {
+      const types = sanitize(ip.attack_types, 100);
+      const countries = sanitize(ip.countries, 20);
+      lines.push(`- ${sanitize(ip.source_ip, 45)} — ${ip.event_count} events (${types}) ${countries ? `from ${countries}` : ''}`);
+    }
+    lines.push('');
+  }
+
+  if (data.top_countries.length > 0) {
+    lines.push('### Top Countries');
+    for (const c of data.top_countries) {
+      lines.push(`- ${sanitize(c.country_code, 5)}: ${c.event_count} events`);
+    }
+    lines.push('');
+  }
+
+  if (data.top_attack_types.length > 0) {
+    lines.push('### Top Attack Types');
+    for (const t of data.top_attack_types) {
+      lines.push(`- ${sanitize(t.type, 50)}: ${t.event_count} events`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
 // ── MCP Server ───────────────────────────────────────────────
 
 const server = new McpServer({
   name: 'defensia',
-  version: '0.2.0',
+  version: '0.3.0',
 });
 
 // Tool 1: Security Overview
@@ -368,10 +402,12 @@ server.tool(
 // Tool 4: Search Events
 server.tool(
   'search_events',
-  'Search security events across all servers. Filter by severity (info/warning/high/critical), event type (brute_force, sql_injection, bot_detected, etc.), or specific server.',
+  'Search security events across all servers. Filter by time period, severity, event type, source IP, or server. Use this to answer "what happened in the last 2 hours" or "show attacks from IP X".',
   {
+    since: z.enum(['1 hour', '2 hours', '6 hours', '12 hours', '24 hours', '7 days', '30 days']).optional().describe('Time period to search (e.g. "2 hours" for recent activity)'),
     severity: z.enum(['info', 'warning', 'high', 'critical']).optional().describe('Filter by severity'),
     type: z.string().max(50).optional().describe('Filter by event type: brute_force, sql_injection, xss_attempt, path_traversal, rce_attempt, scanner_detected, bot_detected, 404_flood, port_scan, flood, geoblock, etc.'),
+    ip: z.string().max(45).optional().describe('Filter by source IP address'),
     server_id: z.number().int().positive().optional().describe('Filter by server ID'),
     page: z.number().int().positive().optional().describe('Page number (default 1)'),
   },
@@ -386,15 +422,21 @@ server.tool(
   },
 );
 
-// Tool 5: Active Bans
+// Tool 5: Search Bans
 server.tool(
-  'get_active_bans',
-  'List all currently active IP bans across your servers, with reason, escalation count, and expiry.',
-  { page: z.number().int().positive().optional().describe('Page number (default 1)') },
+  'search_bans',
+  'Search IP bans across your servers. By default shows active bans only. Use include_expired to see recent bans that already expired. Filter by IP, server, or time period.',
+  {
+    ip: z.string().max(45).optional().describe('Filter by banned IP address'),
+    server_id: z.number().int().positive().optional().describe('Filter by server ID'),
+    since: z.enum(['1 hour', '2 hours', '6 hours', '12 hours', '24 hours', '7 days', '30 days']).optional().describe('Only show bans created in this period'),
+    include_expired: z.boolean().optional().describe('Include expired bans (default: false, only active)'),
+    page: z.number().int().positive().optional().describe('Page number (default 1)'),
+  },
   READ_ONLY_ANNOTATIONS,
-  async ({ page }) => {
+  async (params) => {
     try {
-      const data = await client.getBans(page || 1);
+      const data = await client.getBans(params);
       return { content: [{ type: 'text', text: wrapOutput(formatBans(data)) }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${errorMessage(err)}` }], isError: true };
@@ -414,6 +456,25 @@ server.tool(
     try {
       const briefing = await cached(`briefing-${period || '12 hours'}`, 60_000, () => client.getBriefing(period || '12 hours'));
       return { content: [{ type: 'text', text: wrapOutput(formatBriefing(briefing)) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${errorMessage(err)}` }], isError: true };
+    }
+  },
+);
+
+// Tool 7: Top Attackers
+server.tool(
+  'get_top_attackers',
+  'Get the top attacking IPs, countries, and attack types for a given time period. Great for understanding "who is attacking me" and "what attacks am I getting".',
+  {
+    since: z.enum(['1 hour', '2 hours', '6 hours', '12 hours', '24 hours', '7 days', '30 days']).optional().describe('Time period (default: 24 hours)'),
+    limit: z.number().int().min(1).max(50).optional().describe('Number of results (default: 20)'),
+  },
+  READ_ONLY_ANNOTATIONS,
+  async ({ since, limit }) => {
+    try {
+      const data = await cached(`top-attackers-${since || '24 hours'}-${limit || 20}`, 60_000, () => client.getTopAttackers(since || '24 hours', limit || 20));
+      return { content: [{ type: 'text', text: wrapOutput(formatTopAttackers(data)) }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${errorMessage(err)}` }], isError: true };
     }
